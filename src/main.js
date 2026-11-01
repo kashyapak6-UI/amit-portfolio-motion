@@ -178,25 +178,29 @@ if (!use3D) {
 const track = $("#track"), stage = $("#hero");
 const l1 = $("#l1"), l2 = $("#l2"), cap = $("#cap"), rule = $("#rule"), gridHead = $(".grid-head");
 const intros = [$("#glow"), $("#cross"), $(".hint")];
+const poster = $(".poster");
 const fbCards = $$(".fb-grid figure");
 let target = 0, p = 0, heroOn = true, ribbon = null, lastP = -1;
 const readScroll = () => { target = clamp(scrollY / Math.max(1, track.offsetHeight - stage.offsetHeight)); };
 addEventListener("scroll", readScroll, { passive: true }); readScroll();
 new IntersectionObserver(([e]) => { heroOn = e.isIntersecting; if (!heroOn && ribbon) ribbon.pauseAll(); html.classList.toggle("past-hero", !heroOn || target >= 0.995); }, { rootMargin: "100px" }).observe(track);
 
-const RUN_END = innerWidth < 760 ? 120 : 80;
+const RUN_END = innerWidth < 760 ? 110 : 80;
+const HEAD0 = 0.25;
+const QS = new URLSearchParams(location.search);
 function heroDOM(pp) {
   html.classList.toggle("past-hero", target >= 0.995);
-  const rise = 1 - out(span(pp, 0, 0.12));
-  const run = mix(-50, RUN_END, span(pp, 0, 0.58));
-  l1.style.transform = `translate3d(${run}vw,${rise * 34}vh,0)`;
-  l2.style.transform = `translate3d(${-run}vw,${rise * 34}vh,0)`;
-  cap.style.opacity = 1 - span(pp, 0.52, 0.57);
-  cap.style.transform = `translate(-50%,calc(-50% + ${rise * 34}vh))`;
-  const intro = 1 - span(pp, 0, 0.05);
+  // scroll 0: the title sits fully composed; scrolling splits it apart in opposite directions
+  const run = RUN_END * ease(span(pp, 0.015, 0.5));
+  l1.style.transform = `translate3d(${-run}vw,0,0)`;
+  l2.style.transform = `translate3d(${run}vw,0,0)`;
+  const capA = 1 - span(pp, 0.01, 0.07);
+  cap.style.opacity = capA; cap.style.visibility = capA > 0 ? "" : "hidden";
+  const intro = 1 - span(pp, 0.01, 0.08);
   for (const el of intros) el.style.opacity = intro;
   rule.style.transform = `scaleX(${ease(span(pp, 0.72, 0.86))})`;
   gridHead.style.opacity = span(pp, 0.74, 0.86);
+  if (poster) poster.style.opacity = use3D ? "" : String(1 - span(pp, 0.05, 0.2));
   if (!use3D) fbCards.forEach((f, i) => { const q = out(span(pp, 0.3 + i * 0.05, 0.5 + i * 0.05)); f.style.opacity = q; f.style.transform = `translate3d(0,${(1 - q) * (i % 2 ? -40 : 40)}vh,0) rotate(${(1 - q) * (i % 2 ? 6 : -6)}deg)`; });
 }
 
@@ -209,16 +213,14 @@ if (!touch) stage.addEventListener("pointermove", (e) => {
 stage.addEventListener("click", (e) => { if (ribbon && ribbon.hit(e.clientX, e.clientY, p)) $("#reels").scrollIntoView({ behavior: reduced ? "auto" : "smooth" }); });
 
 // adaptive quality: drop DPR if the device can't hold ~45fps
-let fpsT = performance.now(), fpsN = 0, fpsChecks = 0;
+let fpsT = performance.now(), fpsN = 0, fpsChecks = 0, frameN = 0;
 function heroLoop(now) {
   if (heroOn) {
     p += (target - p) * (reduced ? 1 : 0.09);
     if (Math.abs(target - p) < 0.00005) p = target;
-    if (p !== lastP || (ribbon && p > 0.1)) {
-      if (p !== lastP) heroDOM(p);
-      if (ribbon) ribbon.render(p);
-      lastP = p;
-    }
+    if (p !== lastP) { heroDOM(p); lastP = p; }
+    // renders every frame while visible (idle drift at the top); on phones the idle drift runs at ~30fps
+    if (ribbon && (!lite || p > 0.01 || (frameN++ & 1) === 0)) ribbon.render(p);
     if (ribbon && lite && fpsChecks < 4) { fpsN++; if (now - fpsT > 2000) { if (fpsN / ((now - fpsT) / 1000) < 45) ribbon.lowerDpr(); fpsT = now; fpsN = 0; fpsChecks++; } }
   }
   requestAnimationFrame(heroLoop);
@@ -227,11 +229,14 @@ heroDOM(0);
 requestAnimationFrame(heroLoop);
 
 function bootRibbon() {
-  import("./ribbon.js").then(({ createRibbon }) => {
-    ribbon = createRibbon({ canvas: $("#gl"), stage, items: reelItems, lite, useVideo: !lite && !saveData });
-    ribbon.render(p);
-    html.classList.add("gl-on");
-  }).catch(() => html.classList.add("no3d"));
+  const later = (f) => setTimeout(f, 0);
+  import("./ribbon.js").then(({ createRibbon }) => later(() => {
+    const r = createRibbon({ canvas: $("#gl"), stage, items: reelItems, lite, reduced, useVideo: !lite && !saveData, head0: +(QS.get("h0") || HEAD0), zoom0: +(QS.get("z0") || (innerWidth / innerHeight < 0.9 ? 1.8 : 1)) });
+    r.warm().then(() => later(() => {
+      ribbon = r; ribbon.render(p);
+      requestAnimationFrame(() => html.classList.add("gl-on"));
+    }));
+  })).catch(() => html.classList.add("no3d"));
 }
 if (use3D) {
   if (lite) (window.requestIdleCallback || ((f) => setTimeout(f, 1200)))(bootRibbon, { timeout: 2500 });

@@ -2,7 +2,7 @@
 // (prompt text/code is free to reuse per their terms). Cards use Amit's OWN reels & designs.
 import {
   WebGLRenderer, Scene, PerspectiveCamera, Vector3, Vector2, CatmullRomCurve3, PlaneGeometry,
-  ShaderMaterial, Mesh, DoubleSide, TextureLoader, VideoTexture, LinearFilter, NoColorSpace, LinearSRGBColorSpace,
+  ShaderMaterial, Mesh, DoubleSide, ImageBitmapLoader, Texture, VideoTexture, LinearFilter, NoColorSpace, LinearSRGBColorSpace,
 } from "three";
 
 const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
@@ -10,7 +10,8 @@ const mix = (a, b, t) => a + (b - a) * t;
 const out = (t) => 1 - (1 - t) ** 3;
 const span = (p, a, b) => clamp((p - a) / (b - a));
 
-export function createRibbon({ canvas, stage, items, lite, useVideo }) {
+export function createRibbon({ canvas, stage, items, lite, useVideo, reduced = false, head0 = 0.3, zoom0 = 1 }) {
+  const HEAD0_F = head0;
   const renderer = new WebGLRenderer({ canvas, antialias: !lite, alpha: true, powerPreference: "high-performance" });
   renderer.setClearColor(0, 0);
   renderer.outputColorSpace = LinearSRGBColorSpace;
@@ -54,7 +55,9 @@ void main(){
   c=mix(c,vec3(1.,.357,.122),edge*hot);
   gl_FragColor=vec4(mix(c,vec3(1.),edge*.1),a);
 }`;
-  const loader = new TextureLoader();
+  // decode images off the main thread (ImageBitmap) so texture uploads don't block scrolling
+  const loader = new ImageBitmapLoader().setOptions({ imageOrientation: "flipY", premultiplyAlpha: "none" });
+  const uploadQ = [];
   const setCover = (mat, w, h) => {
     const va = w / h, ca = CARD_W / CARD_H;
     mat.uniforms.cover.value.set(va > ca ? ca / va : 1, va > ca ? 1 : va / ca);
@@ -67,10 +70,13 @@ void main(){
     });
     const mesh = new Mesh(geo, mat); mesh.frustumCulled = false; mesh.visible = false; scene.add(mesh);
     const c = { i, title: it.title, it, geo, mat, mesh, rect: null, v: null, hot: 0 };
-    loader.load(it.tex, (tex) => {
-      tex.colorSpace = NoColorSpace; tex.minFilter = LinearFilter; tex.generateMipmaps = false;
-      if (c.v && mat.uniforms.ready.value === 1 && mat.uniforms.map.value?.isVideoTexture) return;
-      mat.uniforms.map.value = tex; setCover(mat, tex.image.width, tex.image.height); mat.uniforms.ready.value = 1;
+    loader.load(it.tex, (bmp) => {
+      const tex = new Texture(bmp);
+      tex.flipY = false; tex.colorSpace = NoColorSpace; tex.minFilter = LinearFilter; tex.generateMipmaps = false; tex.needsUpdate = true;
+      uploadQ.push(() => {
+        if (mat.uniforms.map.value?.isVideoTexture) return;
+        mat.uniforms.map.value = tex; setCover(mat, bmp.width, bmp.height); mat.uniforms.ready.value = 1;
+      });
     });
     return c;
   });
@@ -145,16 +151,26 @@ void main(){
 
   const RIB_A = 0.14, RIB_B = 0.63, GRID_N = () => cols * rows;
   let hover = null;
+  // idle: the ribbon is already on the rail at scroll 0 and drifts gently; scroll then takes over
+  let HEAD0 = PATH_L * HEAD0_F;
+  const t0 = performance.now();
   function render(pp) {
-    if (pp > 0.08) startVideos();
-    const pr = span(pp, RIB_A, RIB_B), total = PATH_L + cards.length * STEP, head = mix(0, total, pr);
+    if (pp > 0.02) startVideos();
+    if (uploadQ.length) uploadQ.shift()(); // at most one new texture per frame
+    const pr = span(pp, RIB_A, RIB_B), total = PATH_L + cards.length * STEP;
+    const idleK = 1 - span(pp, 0, RIB_A + 0.06);
+    const tt = (performance.now() - t0) / 1000;
+    const drift = reduced ? 0 : idleK * (1.1 * Math.sin(tt * 0.32) + 0.35 * Math.sin(tt * 0.71 + 1.3));
+    const head = mix(HEAD0, total, pr) + drift;
+    const z = mix(1, zoom0, out(idleK));
+    if (Math.abs(camera.zoom - z) > 1e-4) { camera.zoom = z; camera.updateProjectionMatrix(); }
     for (const c of cards) {
       const s = head - c.i * STEP, end = PATH_L - CARD_W;
       if (s < end) {
         c.mesh.visible = s > CARD_W * 0.5; c.rect = null;
         if (c.mesh.visible) poseRibbon(c, head);
       } else if (c.i < GRID_N()) {
-        const st = mix(RIB_A, RIB_B, (end + c.i * STEP) / total), q = out(span(pp, st, st + 0.13));
+        const st = mix(RIB_A, RIB_B, (end + c.i * STEP - HEAD0) / (total - HEAD0)), q = out(span(pp, st, st + 0.13));
         c.mesh.visible = q > 0.001;
         if (c.mesh.visible) poseGrid(c, q);
       } else { c.mesh.visible = false; c.rect = null; }
@@ -177,5 +193,11 @@ void main(){
   }
   function pauseAll() { for (const c of cards) if (c.v && !c.v.paused) c.v.pause(); }
   function lowerDpr() { if (dprCap > 1) { dprCap = 1; resize(); return true; } return false; }
-  return { render, resize, hit, pauseAll, lowerDpr };
+  async function warm() {
+    // compile the shared card shader off the critical path (parallel compile where supported)
+    cards.forEach((c) => (c.mesh.visible = true));
+    try { await renderer.compileAsync(scene, camera); } catch {}
+    cards.forEach((c) => (c.mesh.visible = false));
+  }
+  return { render, resize, hit, pauseAll, lowerDpr, warm, setHead0: (f) => { HEAD0 = PATH_L * f; } };
 }
